@@ -21,7 +21,7 @@ import uuid
 
 from cassandra import ConsistencyLevel, DriverException, Timeout, Unavailable, RequestExecutionException, ReadTimeout, WriteTimeout, CoordinationFailure, ReadFailure, WriteFailure, FunctionFailure, AlreadyExists,\
     InvalidRequest, Unauthorized, AuthenticationFailed, OperationTimedOut, UnsupportedOperation, RequestValidationException, ConfigurationException, ProtocolVersion
-from cassandra.cluster import _Scheduler, Session, Cluster, default_lbp_factory, \
+from cassandra.cluster import _Scheduler, Session, Cluster, ControlConnectionQueryFallback, default_lbp_factory, \
     ExecutionProfile, _ConfigMode, EXEC_PROFILE_DEFAULT
 from cassandra.connection import ConnectionException
 from cassandra.pool import Host
@@ -185,9 +185,35 @@ class ClusterTest(unittest.TestCase):
             with pytest.raises(ValueError):
                 cluster = Cluster(contact_points=['127.0.0.1'], port=invalid_port)
 
-    def test_control_connection_query_fallback_flag(self):
-        assert Cluster().allow_control_connection_query_fallback is False
-        assert Cluster(allow_control_connection_query_fallback=True).allow_control_connection_query_fallback is True
+    def test_control_connection_query_fallback_modes(self):
+        assert Cluster().allow_control_connection_query_fallback is ControlConnectionQueryFallback.Disabled
+        with pytest.raises(TypeError):
+            Cluster(allow_control_connection_query_fallback=False)
+        with pytest.raises(TypeError):
+            Cluster(allow_control_connection_query_fallback=True)
+        assert (
+            Cluster(allow_control_connection_query_fallback=ControlConnectionQueryFallback.Fallback)
+            .allow_control_connection_query_fallback
+            is ControlConnectionQueryFallback.Fallback
+        )
+        assert Cluster(
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.NoNodePoolFallback
+        ).allow_control_connection_query_fallback is ControlConnectionQueryFallback.NoNodePoolFallback
+
+    def test_control_connection_query_fallback_no_node_pool_mode_skips_pool_creation(self):
+        cluster = Cluster(
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.NoNodePoolFallback,
+            monitor_reporting_enabled=False,
+        )
+        host = Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())
+
+        with patch.object(Session, "add_or_renew_pool") as mocked_add_or_renew_pool:
+            session = Session(cluster, [host])
+
+        mocked_add_or_renew_pool.assert_not_called()
+        assert session._initial_connect_futures == set()
+        assert session._pools == {}
+        assert session.update_created_pools() == set()
 
     def test_compression_autodisabled_without_libraries(self):
         with patch.dict('cassandra.cluster.locally_supported_compressions', {}, clear=True):

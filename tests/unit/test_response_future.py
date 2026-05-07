@@ -19,7 +19,7 @@ from threading import RLock
 from unittest.mock import Mock, MagicMock, ANY
 
 from cassandra import ConsistencyLevel, Unavailable, SchemaTargetType, SchemaChangeType, OperationTimedOut
-from cassandra.cluster import Session, ResponseFuture, NoHostAvailable, ProtocolVersion
+from cassandra.cluster import Session, ResponseFuture, NoHostAvailable, ProtocolVersion, ControlConnectionQueryFallback
 from cassandra.connection import Connection, ConnectionException
 from cassandra.protocol import (ReadTimeoutErrorMessage, WriteTimeoutErrorMessage,
                                 UnavailableErrorMessage, ResultMessage, QueryMessage,
@@ -41,7 +41,7 @@ class ResponseFutureTests(unittest.TestCase):
         s = Mock(spec=Session)
         s.row_factory = lambda col_names, rows: [(col_names, rows)]
         s.cluster.control_connection._tablets_routing_v1 = False
-        s.cluster.allow_control_connection_query_fallback = False
+        s.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Disabled
         return s
 
     def make_pool(self):
@@ -424,7 +424,7 @@ class ResponseFutureTests(unittest.TestCase):
 
     def test_control_connection_fallback_updates_connection_keyspace(self):
         session = self.make_basic_session()
-        session.cluster.allow_control_connection_query_fallback = True
+        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Fallback
         session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1']
         session._pools = {}
 
@@ -452,7 +452,7 @@ class ResponseFutureTests(unittest.TestCase):
 
     def test_control_connection_fallback_when_no_usable_pools(self):
         session = self.make_basic_session()
-        session.cluster.allow_control_connection_query_fallback = True
+        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.NoNodePoolFallback
         session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1', 'ip2']
         session._pools = {}
         connection = self.make_control_connection()
@@ -478,7 +478,7 @@ class ResponseFutureTests(unittest.TestCase):
 
     def test_control_connection_fallback_retries_after_server_error(self):
         session = self.make_basic_session()
-        session.cluster.allow_control_connection_query_fallback = True
+        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Fallback
         session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1']
         session._pools = {}
         connection = self.make_control_connection()
@@ -516,7 +516,7 @@ class ResponseFutureTests(unittest.TestCase):
 
     def test_control_connection_fallback_fetches_next_page(self):
         session = self.make_basic_session()
-        session.cluster.allow_control_connection_query_fallback = True
+        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Fallback
         session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1']
         session._pools = {}
         connection = self.make_control_connection()
@@ -550,7 +550,7 @@ class ResponseFutureTests(unittest.TestCase):
 
     def test_control_connection_fallback_reprepares_prepared_statement(self):
         session = self.make_basic_session()
-        session.cluster.allow_control_connection_query_fallback = True
+        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Fallback
         session.cluster.protocol_version = ProtocolVersion.V4
         session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1']
         session._pools = {}
@@ -606,7 +606,7 @@ class ResponseFutureTests(unittest.TestCase):
 
     def test_control_connection_fallback_not_used_when_pool_can_serve(self):
         session = self.make_basic_session()
-        session.cluster.allow_control_connection_query_fallback = True
+        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Fallback
         session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1']
         pool = Mock(is_shutdown=False)
         pool.borrow_connection.side_effect = NoConnectionsAvailable()
@@ -623,7 +623,7 @@ class ResponseFutureTests(unittest.TestCase):
 
     def test_control_connection_fallback_orphans_stream_on_timeout(self):
         session = self.make_basic_session()
-        session.cluster.allow_control_connection_query_fallback = True
+        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Fallback
         session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1']
         session._pools = {}
         connection = self.make_control_connection()

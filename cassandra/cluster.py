@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as wait
 from copy import copy
 from functools import partial, reduce, wraps
 from itertools import groupby, count, chain
+import enum
 import json
 import logging
 from typing import Any, Dict, Optional, Union
@@ -610,6 +611,31 @@ class _ConfigMode(object):
     PROFILES = 2
 
 
+class ControlConnectionQueryFallback(enum.Enum):
+    """
+    Controls how application queries use the control connection when node pools
+    are unavailable.
+
+    ``Disabled`` requires a usable node pool for application queries. If the
+    driver cannot establish one during session startup, it raises
+    :class:`NoHostAvailable`.
+
+    ``Fallback`` still attempts to create node pools, but allows application
+    queries to fall back to the control connection when no usable node pool is
+    available. Session startup is allowed to proceed even if the initial pool
+    attempts all fail.
+
+    ``NoNodePoolFallback`` disables node-pool creation for the session and uses
+    the control-connection fallback path for application queries.
+
+    The fallback path is not used for requests targeted to an explicit host.
+    """
+
+    Disabled = "Disabled"
+    Fallback = "Fallback"
+    NoNodePoolFallback = "NoNodePoolFallback"
+
+
 class Cluster(object):
     """
     The main class to use when interacting with a Cassandra cluster.
@@ -930,19 +956,14 @@ class Cluster(object):
     If set to :const:`None`, there will be no timeout for these queries.
     """
 
-    allow_control_connection_query_fallback = False
+    allow_control_connection_query_fallback: ControlConnectionQueryFallback = ControlConnectionQueryFallback.Disabled
     """
-    Enables an opt-in degraded path for application queries.
+    Controls whether application queries may fall back to the control connection.
 
-    When :const:`True`, a request may be sent on the control connection if
-    the session has no usable node connection pools. This is intended for
-    deployments that expose the cluster through a non-broadcast IP address,
-    such as a TCP proxy or a node's public IP address, where the driver
-    cannot fill the normal pool set. Queries can still execute over the single
-    control connection, but throughput is poor and connection churn raises the
-    chance of request errors. Do not enable this in production.
-
-    This fallback is not used for requests targeted to an explicit host.
+    ``Disabled`` keeps the old behavior.
+    ``Fallback`` enables control-connection fallback when no usable node pools exist.
+    ``NoNodePoolFallback`` skips node-pool creation and uses the control connection fallback path.
+    This fallback is still not used for requests targeted to an explicit host.
     """
 
     idle_heartbeat_interval = 30
@@ -1232,17 +1253,13 @@ class Cluster(object):
                  column_encryption_policy=None,
                  application_info:Optional[ApplicationInfoBase]=None,
                  client_routes_config:Optional[ClientRoutesConfig]=None,
-                 allow_control_connection_query_fallback:Optional[bool]=False
+                 allow_control_connection_query_fallback:Optional[ControlConnectionQueryFallback]=ControlConnectionQueryFallback.Disabled
                  ):
         """
         ``executor_threads`` defines the number of threads in a pool for handling asynchronous tasks such as
         extablishing connection pools or refreshing metadata.
 
         Any of the mutable Cluster attributes may be set as keyword arguments to the constructor.
-        ``allow_control_connection_query_fallback`` is a degraded-availability
-        setting for cases where the driver reaches the cluster through a
-        non-broadcast IP address and cannot populate the normal pools. It
-        should not be enabled in production.
         """
 
         # Handle port passed as string
@@ -1253,6 +1270,10 @@ class Cluster(object):
 
         if port < 1 or port > 65535:
             raise ValueError("Invalid port number (%s) (1-65535)" % port)
+
+        if not isinstance(allow_control_connection_query_fallback, ControlConnectionQueryFallback):
+            raise TypeError(
+                "allow_control_connection_query_fallback must be a ControlConnectionQueryFallback value")
 
         if connection_class is not None:
             self.connection_class = connection_class
@@ -1484,7 +1505,7 @@ class Cluster(object):
         self.cql_version = cql_version
         self.max_schema_agreement_wait = max_schema_agreement_wait
         self.control_connection_timeout = control_connection_timeout
-        self.allow_control_connection_query_fallback = bool(allow_control_connection_query_fallback)
+        self.allow_control_connection_query_fallback = allow_control_connection_query_fallback
         self.metadata_request_timeout = self.control_connection_timeout if metadata_request_timeout is None else metadata_request_timeout
         self.idle_heartbeat_interval = idle_heartbeat_interval
         self.idle_heartbeat_timeout = idle_heartbeat_timeout
@@ -1827,7 +1848,8 @@ class Cluster(object):
         return pools
 
     def is_shard_aware(self):
-        return bool(self.get_all_pools()[0].host.sharding_info)
+        pools = self.get_all_pools()
+        return bool(pools and pools[0].host.sharding_info)
 
     def shard_aware_stats(self):
         if self.is_shard_aware():
@@ -2645,20 +2667,22 @@ class Session(object):
 
         # create connection pools in parallel
         self._initial_connect_futures = set()
-        for host in hosts:
-            future = self.add_or_renew_pool(host, is_host_addition=False)
-            if future:
-                self._initial_connect_futures.add(future)
+        fallback_mode = self.cluster.allow_control_connection_query_fallback
+        if fallback_mode is not ControlConnectionQueryFallback.NoNodePoolFallback:
+            for host in hosts:
+                future = self.add_or_renew_pool(host, is_host_addition=False)
+                if future:
+                    self._initial_connect_futures.add(future)
 
-        futures = wait_futures(self._initial_connect_futures, return_when=FIRST_COMPLETED)
-        while futures.not_done and not any(f.result() for f in futures.done):
-            futures = wait_futures(futures.not_done, return_when=FIRST_COMPLETED)
+            futures = wait_futures(self._initial_connect_futures, return_when=FIRST_COMPLETED)
+            while futures.not_done and not any(f.result() for f in futures.done):
+                futures = wait_futures(futures.not_done, return_when=FIRST_COMPLETED)
 
-        if not any(f.result() for f in self._initial_connect_futures):
-            msg = "Unable to connect to any servers"
-            if self.keyspace:
-                msg += " using keyspace '%s'" % self.keyspace
-            raise NoHostAvailable(msg, [h.address for h in hosts])
+            if not any(f.result() for f in self._initial_connect_futures):
+                msg = "Unable to connect to any servers"
+                if self.keyspace:
+                    msg += " using keyspace '%s'" % self.keyspace
+                raise NoHostAvailable(msg, [h.address for h in hosts])
 
         self.session_id = uuid.uuid4()
 
@@ -3257,6 +3281,9 @@ class Session(object):
         """
         For internal use only.
         """
+        if self.cluster.allow_control_connection_query_fallback is ControlConnectionQueryFallback.NoNodePoolFallback:
+            return None
+
         distance = self._profile_manager.distance(host)
         if distance == HostDistance.IGNORED:
             return None
@@ -3327,6 +3354,9 @@ class Session(object):
 
         For internal use only.
         """
+        if self.cluster.allow_control_connection_query_fallback is ControlConnectionQueryFallback.NoNodePoolFallback:
+            return set()
+
         futures = set()
         for host in self.cluster.metadata.all_hosts():
             distance = self._profile_manager.distance(host)
@@ -4650,10 +4680,16 @@ class ResponseFuture(object):
         return any(pool and not pool.is_shutdown for pool in pools)
 
     def _fallback_to_control_connection(self):
-        if getattr(self.session.cluster, 'allow_control_connection_query_fallback', False) is not True:
+        fallback_mode = getattr(
+            self.session.cluster,
+            'allow_control_connection_query_fallback',
+            ControlConnectionQueryFallback.Disabled)
+        if fallback_mode is ControlConnectionQueryFallback.Disabled:
             return False
         if self._host or self._control_connection_query_attempted:
             return False
+        if fallback_mode is ControlConnectionQueryFallback.NoNodePoolFallback:
+            return True
         return not self._has_usable_node_pool()
 
     def _borrow_control_connection(self, connection):
