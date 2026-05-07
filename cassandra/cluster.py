@@ -2678,7 +2678,9 @@ class Session(object):
             while futures.not_done and not any(f.result() for f in futures.done):
                 futures = wait_futures(futures.not_done, return_when=FIRST_COMPLETED)
 
-            if not any(f.result() for f in self._initial_connect_futures):
+            # Only Disabled requires an initial pool to come up.
+            if not any(f.result() for f in self._initial_connect_futures) and \
+                    fallback_mode is ControlConnectionQueryFallback.Disabled:
                 msg = "Unable to connect to any servers"
                 if self.keyspace:
                     msg += " using keyspace '%s'" % self.keyspace

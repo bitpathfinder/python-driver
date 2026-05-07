@@ -13,6 +13,7 @@
 # limitations under the License.
 import unittest
 
+from concurrent.futures import Future
 import logging
 import socket
 
@@ -214,6 +215,22 @@ class ClusterTest(unittest.TestCase):
         assert session._initial_connect_futures == set()
         assert session._pools == {}
         assert session.update_created_pools() == set()
+
+    def test_control_connection_query_fallback_fallback_tolerates_empty_initial_pools(self):
+        cluster = Cluster(
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.Fallback,
+            monitor_reporting_enabled=False,
+        )
+        host = Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())
+        future = Future()
+        future.set_result(False)
+
+        with patch.object(Session, "add_or_renew_pool", return_value=future) as mocked_add_or_renew_pool:
+            session = Session(cluster, [host])
+
+        mocked_add_or_renew_pool.assert_called_once_with(host, is_host_addition=False)
+        assert session._initial_connect_futures == {future}
+        assert session._pools == {}
 
     def test_compression_autodisabled_without_libraries(self):
         with patch.dict('cassandra.cluster.locally_supported_compressions', {}, clear=True):
