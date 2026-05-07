@@ -644,6 +644,32 @@ class ResponseFutureTests(unittest.TestCase):
         with pytest.raises(OperationTimedOut):
             rf.result()
 
+    def test_control_connection_fallback_timeout_without_metadata_host_uses_connection_endpoint(self):
+        session = self.make_basic_session()
+        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Fallback
+        session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1']
+        session._pools = {}
+        session.cluster.get_control_connection_host.return_value = None
+        connection = self.make_control_connection()
+        session.cluster.control_connection._connection = connection
+
+        def send_msg(message, request_id, cb, **kwargs):
+            connection._requests[request_id] = (cb, kwargs.get('decoder'), kwargs.get('result_metadata'))
+            return 128
+
+        connection.send_msg.side_effect = send_msg
+
+        rf = self.make_response_future(session)
+        rf.send_request()
+        rf._on_timeout()
+
+        with pytest.raises(OperationTimedOut) as exc_info:
+            rf.result()
+
+        assert exc_info.value.errors == {
+            'control-host': 'Client request timeout. See Session.execute[_async](timeout)'
+        }
+
     def test_first_pool_shutdown(self):
         session = self.make_basic_session()
         session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1', 'ip2']

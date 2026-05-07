@@ -4601,7 +4601,13 @@ class ResponseFuture(object):
         errors = self._errors
         if not errors:
             if self.is_schema_agreed:
-                key = str(self._get_host_endpoint(self._current_host)) if self._current_host else 'no host queried before timeout'
+                if self._current_host is None:
+                    key = 'no host queried before timeout'
+                elif self._connection is not None and self._connection.is_control_connection:
+                    control_host = self.session.cluster.get_control_connection_host()
+                    key = str(control_host.endpoint) if control_host is not None else str(self._connection.endpoint)
+                else:
+                    key = str(self._current_host.endpoint)
                 errors = {key: "Client request timeout. See Session.execute[_async](timeout)"}
             else:
                 connection = self.session.cluster.control_connection._connection
@@ -4668,10 +4674,6 @@ class ResponseFuture(object):
             self._set_final_exception(NoHostAvailable(
                 "Unable to complete the operation against any hosts", self._errors))
         return False
-
-    @staticmethod
-    def _get_host_endpoint(host):
-        return getattr(host, 'endpoint', host)
 
     def _has_usable_node_pool(self):
         try:
