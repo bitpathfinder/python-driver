@@ -625,7 +625,7 @@ class ControlConnectionQueryFallback(enum.Enum):
     available. Session startup is allowed to proceed even if the initial pool
     attempts all fail.
 
-    ``NoNodePoolFallback`` disables node-pool creation for the session and uses
+    ``SkipPoolCreation`` disables node-pool creation for the session and uses
     the control-connection fallback path for application queries.
 
     The fallback path is not used for requests targeted to an explicit host.
@@ -633,7 +633,7 @@ class ControlConnectionQueryFallback(enum.Enum):
 
     Disabled = "Disabled"
     Fallback = "Fallback"
-    NoNodePoolFallback = "NoNodePoolFallback"
+    SkipPoolCreation = "SkipPoolCreation"
 
 
 class Cluster(object):
@@ -962,7 +962,7 @@ class Cluster(object):
 
     ``Disabled`` keeps the old behavior.
     ``Fallback`` enables control-connection fallback when no usable node pools exist.
-    ``NoNodePoolFallback`` skips node-pool creation and uses the control connection fallback path.
+    ``SkipPoolCreation`` skips node-pool creation and uses the control connection fallback path.
     This fallback is still not used for requests targeted to an explicit host.
     """
 
@@ -2668,7 +2668,7 @@ class Session(object):
         # create connection pools in parallel
         self._initial_connect_futures = set()
         fallback_mode = self.cluster.allow_control_connection_query_fallback
-        if fallback_mode is not ControlConnectionQueryFallback.NoNodePoolFallback:
+        if fallback_mode is not ControlConnectionQueryFallback.SkipPoolCreation:
             for host in hosts:
                 future = self.add_or_renew_pool(host, is_host_addition=False)
                 if future:
@@ -3283,7 +3283,7 @@ class Session(object):
         """
         For internal use only.
         """
-        if self.cluster.allow_control_connection_query_fallback is ControlConnectionQueryFallback.NoNodePoolFallback:
+        if self.cluster.allow_control_connection_query_fallback is ControlConnectionQueryFallback.SkipPoolCreation:
             return None
 
         distance = self._profile_manager.distance(host)
@@ -3356,7 +3356,7 @@ class Session(object):
 
         For internal use only.
         """
-        if self.cluster.allow_control_connection_query_fallback is ControlConnectionQueryFallback.NoNodePoolFallback:
+        if self.cluster.allow_control_connection_query_fallback is ControlConnectionQueryFallback.SkipPoolCreation:
             return set()
 
         futures = set()
@@ -4592,7 +4592,7 @@ class ResponseFuture(object):
                         self._connection.orphaned_threshold_reached = True
 
                 pool.return_connection(self._connection, stream_was_orphaned=True)
-            elif getattr(self._connection, 'is_control_connection', False):
+            elif self._connection.is_control_connection:
                 with self._connection.lock:
                     self._connection.orphaned_request_ids.add(self._req_id)
                     if len(self._connection.orphaned_request_ids) >= self._connection.orphaned_threshold:
@@ -4682,15 +4682,12 @@ class ResponseFuture(object):
         return any(pool and not pool.is_shutdown for pool in pools)
 
     def _fallback_to_control_connection(self):
-        fallback_mode = getattr(
-            self.session.cluster,
-            'allow_control_connection_query_fallback',
-            ControlConnectionQueryFallback.Disabled)
+        fallback_mode = self.session.cluster.allow_control_connection_query_fallback
         if fallback_mode is ControlConnectionQueryFallback.Disabled:
             return False
         if self._host or self._control_connection_query_attempted:
             return False
-        if fallback_mode is ControlConnectionQueryFallback.NoNodePoolFallback:
+        if fallback_mode is ControlConnectionQueryFallback.SkipPoolCreation:
             return True
         return not self._has_usable_node_pool()
 
@@ -4886,7 +4883,7 @@ class ResponseFuture(object):
 
     def _reprepare(self, prepare_message, host, connection, pool):
         cb = partial(self.session.submit, self._execute_after_prepare, host, connection, pool)
-        if pool is None and getattr(connection, 'is_control_connection', False):
+        if pool is None and connection is not None and connection.is_control_connection:
             request_id = self._query_control_connection(prepare_message, cb=cb,
                                                         connection=connection, host=host)
         else:
@@ -5107,10 +5104,10 @@ class ResponseFuture(object):
                     new_metadata_id = response.result_metadata_id
                     if new_metadata_id is not None:
                         self.prepared_statement.result_metadata_id = new_metadata_id
-
+                
                 # use self._query to re-use the same host and
                 # at the same time properly borrow the connection
-                if pool is None and getattr(connection, 'is_control_connection', False):
+                if pool is None and connection is not None and connection.is_control_connection:
                     request_id = self._query_control_connection(connection=connection, host=host)
                 else:
                     request_id = self._query(host)

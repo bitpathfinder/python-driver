@@ -198,12 +198,12 @@ class ClusterTest(unittest.TestCase):
             is ControlConnectionQueryFallback.Fallback
         )
         assert Cluster(
-            allow_control_connection_query_fallback=ControlConnectionQueryFallback.NoNodePoolFallback
-        ).allow_control_connection_query_fallback is ControlConnectionQueryFallback.NoNodePoolFallback
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.SkipPoolCreation
+        ).allow_control_connection_query_fallback is ControlConnectionQueryFallback.SkipPoolCreation
 
     def test_control_connection_query_fallback_no_node_pool_mode_skips_pool_creation(self):
         cluster = Cluster(
-            allow_control_connection_query_fallback=ControlConnectionQueryFallback.NoNodePoolFallback,
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.SkipPoolCreation,
             monitor_reporting_enabled=False,
         )
         host = Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())

@@ -98,7 +98,7 @@ class ControlConnectionQueryFallbackIntegrationTests(unittest.TestCase):
 
     def test_no_node_pool_fallback_executes_queries_without_creating_pools(self):
         self.cluster = TestCluster(
-            allow_control_connection_query_fallback=ControlConnectionQueryFallback.NoNodePoolFallback,
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.SkipPoolCreation,
             connect_timeout=1,
             monitor_reporting_enabled=False,
         )

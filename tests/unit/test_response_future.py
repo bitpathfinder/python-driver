@@ -452,7 +452,7 @@ class ResponseFutureTests(unittest.TestCase):
 
     def test_control_connection_fallback_when_no_usable_pools(self):
         session = self.make_basic_session()
-        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.NoNodePoolFallback
+        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.SkipPoolCreation
         session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1', 'ip2']
         session._pools = {}
         connection = self.make_control_connection()
