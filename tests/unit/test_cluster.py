@@ -23,6 +23,7 @@ from cassandra import ConsistencyLevel, DriverException, Timeout, Unavailable, R
     InvalidRequest, Unauthorized, AuthenticationFailed, OperationTimedOut, UnsupportedOperation, RequestValidationException, ConfigurationException, ProtocolVersion
 from cassandra.cluster import _Scheduler, Session, Cluster, default_lbp_factory, \
     ExecutionProfile, _ConfigMode, EXEC_PROFILE_DEFAULT
+from cassandra.connection import ConnectionException
 from cassandra.pool import Host
 from cassandra.policies import HostDistance, RetryPolicy, RoundRobinPolicy, DowngradingConsistencyRetryPolicy, SimpleConvictionPolicy
 from cassandra.query import SimpleStatement, named_tuple_factory, tuple_factory
@@ -184,6 +185,10 @@ class ClusterTest(unittest.TestCase):
             with pytest.raises(ValueError):
                 cluster = Cluster(contact_points=['127.0.0.1'], port=invalid_port)
 
+    def test_control_connection_query_fallback_flag(self):
+        assert Cluster().allow_control_connection_query_fallback is False
+        assert Cluster(allow_control_connection_query_fallback=True).allow_control_connection_query_fallback is True
+
     def test_compression_autodisabled_without_libraries(self):
         with patch.dict('cassandra.cluster.locally_supported_compressions', {}, clear=True):
             with patch('cassandra.cluster.log') as patched_logger:
@@ -338,6 +343,32 @@ class SessionTest(unittest.TestCase):
         query = s.execute.call_args[0][0]
         assert query == 'USE simple_ks', (
             "Simple keyspace names should not be quoted, got: %r" % query)
+
+    @mock_session_pools
+    def test_set_keyspace_for_all_pools_reports_all_errors(self, *_):
+        cluster = Cluster()
+        session = Session(
+            cluster,
+            [Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())],
+        )
+
+        pool1 = Mock(host='host1')
+        pool2 = Mock(host='host2')
+        keyspace_error = ConnectionException("boom")
+
+        pool1._set_keyspace_for_all_conns.side_effect = (
+            lambda keyspace, callback: callback(pool1, [keyspace_error])
+        )
+        pool2._set_keyspace_for_all_conns.side_effect = (
+            lambda keyspace, callback: callback(pool2, [])
+        )
+        session._pools = {'host1': pool1, 'host2': pool2}
+
+        callback = Mock()
+        session._set_keyspace_for_all_pools('ks', callback)
+
+        callback.assert_called_once()
+        assert callback.call_args.args[0] == {'host1': [keyspace_error]}
 
 class ProtocolVersionTests(unittest.TestCase):
 

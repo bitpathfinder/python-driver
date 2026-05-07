@@ -48,6 +48,8 @@ Clusters and Sessions
 
    .. autoattribute:: control_connection_timeout
 
+   .. autoattribute:: allow_control_connection_query_fallback
+
    .. autoattribute:: idle_heartbeat_interval
 
    .. autoattribute:: idle_heartbeat_timeout

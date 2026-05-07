@@ -930,6 +930,21 @@ class Cluster(object):
     If set to :const:`None`, there will be no timeout for these queries.
     """
 
+    allow_control_connection_query_fallback = False
+    """
+    Enables an opt-in degraded path for application queries.
+
+    When :const:`True`, a request may be sent on the control connection if
+    the session has no usable node connection pools. This is intended for
+    deployments that expose the cluster through a non-broadcast IP address,
+    such as a TCP proxy or a node's public IP address, where the driver
+    cannot fill the normal pool set. Queries can still execute over the single
+    control connection, but throughput is poor and connection churn raises the
+    chance of request errors. Do not enable this in production.
+
+    This fallback is not used for requests targeted to an explicit host.
+    """
+
     idle_heartbeat_interval = 30
     """
     Interval, in seconds, on which to heartbeat idle connections. This helps
@@ -1216,13 +1231,18 @@ class Cluster(object):
                  metadata_request_timeout: Optional[float] = None,
                  column_encryption_policy=None,
                  application_info:Optional[ApplicationInfoBase]=None,
-                 client_routes_config:Optional[ClientRoutesConfig]=None
+                 client_routes_config:Optional[ClientRoutesConfig]=None,
+                 allow_control_connection_query_fallback:Optional[bool]=False
                  ):
         """
         ``executor_threads`` defines the number of threads in a pool for handling asynchronous tasks such as
         extablishing connection pools or refreshing metadata.
 
         Any of the mutable Cluster attributes may be set as keyword arguments to the constructor.
+        ``allow_control_connection_query_fallback`` is a degraded-availability
+        setting for cases where the driver reaches the cluster through a
+        non-broadcast IP address and cannot populate the normal pools. It
+        should not be enabled in production.
         """
 
         # Handle port passed as string
@@ -1464,6 +1484,7 @@ class Cluster(object):
         self.cql_version = cql_version
         self.max_schema_agreement_wait = max_schema_agreement_wait
         self.control_connection_timeout = control_connection_timeout
+        self.allow_control_connection_query_fallback = bool(allow_control_connection_query_fallback)
         self.metadata_request_timeout = self.control_connection_timeout if metadata_request_timeout is None else metadata_request_timeout
         self.idle_heartbeat_interval = idle_heartbeat_interval
         self.idle_heartbeat_timeout = idle_heartbeat_timeout
@@ -4439,6 +4460,7 @@ class ResponseFuture(object):
     _spec_execution_plan = NoSpeculativeExecutionPlan()
     _continuous_paging_session = None
     _host = None
+    _control_connection_query_attempted = False
     _TABLET_ROUTING_CTYPE = None
 
     _warned_timeout = False
@@ -4459,6 +4481,7 @@ class ResponseFuture(object):
         self._callback_lock = Lock()
         self._start_time = start_time or time.time()
         self._host = host
+        self._control_connection_query_attempted = False
         self._spec_execution_plan = speculative_execution_plan or self._spec_execution_plan
         self._make_query_plan()
         self._event = Event()
@@ -4537,11 +4560,16 @@ class ResponseFuture(object):
                         self._connection.orphaned_threshold_reached = True
 
                 pool.return_connection(self._connection, stream_was_orphaned=True)
+            elif getattr(self._connection, 'is_control_connection', False):
+                with self._connection.lock:
+                    self._connection.orphaned_request_ids.add(self._req_id)
+                    if len(self._connection.orphaned_request_ids) >= self._connection.orphaned_threshold:
+                        self._connection.orphaned_threshold_reached = True
 
         errors = self._errors
         if not errors:
             if self.is_schema_agreed:
-                key = str(self._current_host.endpoint) if self._current_host else 'no host queried before timeout'
+                key = str(self._get_host_endpoint(self._current_host)) if self._current_host else 'no host queried before timeout'
                 errors = {key: "Client request timeout. See Session.execute[_async](timeout)"}
             else:
                 connection = self.session.cluster.control_connection._connection
@@ -4599,13 +4627,110 @@ class ResponseFuture(object):
                 self._on_timeout()
                 return True
         if error_no_hosts:
+            if self._fallback_to_control_connection():
+                req_id = self._query_control_connection()
+                if req_id is not None:
+                    self._req_id = req_id
+                    return True
+
             self._set_final_exception(NoHostAvailable(
                 "Unable to complete the operation against any hosts", self._errors))
         return False
 
+    @staticmethod
+    def _get_host_endpoint(host):
+        return getattr(host, 'endpoint', host)
+
+    def _has_usable_node_pool(self):
+        try:
+            pools = tuple(self.session._pools.values())
+        except (AttributeError, TypeError):
+            return False
+
+        return any(pool and not pool.is_shutdown for pool in pools)
+
+    def _fallback_to_control_connection(self):
+        if getattr(self.session.cluster, 'allow_control_connection_query_fallback', False) is not True:
+            return False
+        if self._host or self._control_connection_query_attempted:
+            return False
+        return not self._has_usable_node_pool()
+
+    def _borrow_control_connection(self, connection):
+        with connection.lock:
+            if connection.in_flight >= connection.max_request_id:
+                raise NoConnectionsAvailable("All request IDs are currently in use")
+            connection.in_flight += 1
+            return connection.get_request_id()
+
+    def _release_control_connection_request(self, connection, request_id):
+        with connection.lock:
+            connection.in_flight -= 1
+            connection.request_ids.append(request_id)
+            connection._requests.pop(request_id, None)
+
+    def _handle_control_connection_response(self, connection, cb, response):
+        with connection.lock:
+            connection.in_flight -= 1
+        cb(response)
+
+    def _query_control_connection(self, message=None, cb=None, connection=None, host=None):
+        self._control_connection_query_attempted = True
+
+        if message is None:
+            message = self.message
+
+        if connection is None:
+            control_connection = self.session.cluster.control_connection
+            connection = control_connection._connection if control_connection else None
+        if not connection:
+            self._errors['control connection'] = ConnectionException("Control connection is not connected")
+            return None
+
+        if host is None:
+            host = self.session.cluster.get_control_connection_host() or connection.endpoint
+        self._current_host = host
+
+        request_id = None
+        request_sent = False
+        try:
+            request_id = self._borrow_control_connection(connection)
+            self._connection = connection
+            result_meta = self.prepared_statement.result_metadata if self.prepared_statement else []
+            if cb is None:
+                cb = partial(self._set_result, host, connection, None)
+            cb = partial(self._handle_control_connection_response, connection, cb)
+
+            log.debug("No usable node pools; falling back to control connection for host %s", host)
+            self.request_encoded_size = connection.send_msg(message, request_id, cb=cb,
+                                                            encoder=self._protocol_handler.encode_message,
+                                                            decoder=self._protocol_handler.decode_message,
+                                                            result_metadata=result_meta)
+            request_sent = True
+            self.attempted_hosts.append(host)
+            return request_id
+        except NoConnectionsAvailable as exc:
+            log.debug("Control connection is at capacity")
+            self._errors[host] = exc
+        except ConnectionBusy as exc:
+            log.debug("Control connection is busy")
+            self._errors[host] = exc
+        except Exception as exc:
+            log.debug("Error querying control connection", exc_info=True)
+            self._errors[host] = exc
+            if self._metrics is not None:
+                self._metrics.on_connection_error()
+        finally:
+            if request_id is not None and not request_sent:
+                self._release_control_connection_request(connection, request_id)
+
+        return None
+
     def _query(self, host, message=None, cb=None):
         if message is None:
             message = self.message
+
+        self._control_connection_query_attempted = False
 
         pool = self.session._pools.get(host)
         if not pool:
@@ -4717,12 +4842,17 @@ class ResponseFuture(object):
         self._event.clear()
         self._final_result = _NOT_SET
         self._final_exception = None
+        self._control_connection_query_attempted = False
         self._start_timer()
         self.send_request()
 
     def _reprepare(self, prepare_message, host, connection, pool):
         cb = partial(self.session.submit, self._execute_after_prepare, host, connection, pool)
-        request_id = self._query(host, prepare_message, cb=cb)
+        if pool is None and getattr(connection, 'is_control_connection', False):
+            request_id = self._query_control_connection(prepare_message, cb=cb,
+                                                        connection=connection, host=host)
+        else:
+            request_id = self._query(host, prepare_message, cb=cb)
         if request_id is None:
             # try to submit the original prepared statement on some other host
             self.send_request()
@@ -4761,6 +4891,8 @@ class ResponseFuture(object):
             if isinstance(response, ResultMessage):
                 if response.kind == RESULT_KIND_SET_KEYSPACE:
                     session = getattr(self, 'session', None)
+                    if connection is not None:
+                        connection.keyspace = response.new_keyspace
                     # since we're running on the event loop thread, we need to
                     # use a non-blocking method for setting the keyspace on
                     # all connections in this session, otherwise the event
@@ -4940,7 +5072,10 @@ class ResponseFuture(object):
 
                 # use self._query to re-use the same host and
                 # at the same time properly borrow the connection
-                request_id = self._query(host)
+                if pool is None and getattr(connection, 'is_control_connection', False):
+                    request_id = self._query_control_connection(connection=connection, host=host)
+                else:
+                    request_id = self._query(host)
                 if request_id is None:
                     # this host errored out, move on to the next
                     self.send_request()
@@ -5051,6 +5186,11 @@ class ResponseFuture(object):
         if self._final_exception:
             # the connection probably broke while we were waiting
             # to retry the operation
+            return
+
+        if self._control_connection_query_attempted:
+            self._control_connection_query_attempted = False
+            self.send_request()
             return
 
         if reuse_connection and self._query(host) is not None:
